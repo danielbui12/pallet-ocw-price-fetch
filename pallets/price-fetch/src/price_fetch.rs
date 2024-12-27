@@ -1,32 +1,59 @@
 use super::*;
+use polkadot_sdk::{sp_io, sp_std};
 
 impl<T: Config> Pallet<T> {
+	/// Add new price to the list.
+	pub fn add_price(payload: Vec<PricePayload>) {
+        log::info!("payload len: {}", payload.len());
+        for PricePayload { price, symbol } in payload.iter() {
+            // Convert symbol bytes to string
+            let symbol_str = sp_std::str::from_utf8(symbol)
+                .expect("Invalid UTF-8 in symbol"); // Handle UTF-8 conversion safely
+            
+            // Log the price and symbol
+            log::info!("Adding {} to the price: {}", symbol_str, price);
+            
+            // Insert the price into the storage
+            <Prices<T>>::insert(symbol.clone(), price.clone());
+    
+            // Emit an event for the new price
+            Self::deposit_event(Event::NewPrice(symbol.clone(), price.clone()));
+        }
+	}
+
 	/// A helper function to fetch the price and send a raw unsigned transaction.
-	pub fn fetch_price_and_send_raw_unsigned(
-		block_number: BlockNumberFor<T>,
-	) -> Result<(), &'static str> {
+    pub fn safe_fetch_price<'a>(
+        block_number: BlockNumberFor<T>,
+        symbol: &'a [u8],
+        remote_url: &'a [u8],
+	) -> Result<Price, &'static str> {
         // Make sure we don't fetch the price if unsigned transaction is going to be rejected
 		// anyway.
-		let next_unsigned_at = NextUnsignedAt::<T>::get();
+		let next_unsigned_at = NextUnsignedAt::<T>::get();        
 		if next_unsigned_at > block_number {
 			return Err("Too early to send unsigned transaction")
 		}
 
-		let price = Self::fetch_price().map_err(|_| "Failed to fetch price")?;
-        // TODO:
-		// SubmitTransaction::<T, Call<T>>::submit_transaction(
-        //     Call::submit_price_unsigned { block_number, price }
-        // ).map_err(|()| "Unable to submit unsigned transaction.")?;
-
-		Ok(())
+		let price = Self::fetch_price(remote_url).map_err(|e| {
+            log::error!("fetch price error: {:?}", e);
+            "Failed to fetch price"
+        })?;
+        
+        let symbol_str = sp_std::str::from_utf8(&symbol).unwrap();
+        log::info!("{} got price: {} cents", symbol_str, price);
+    
+		Ok(price)
 	}
 
 
 	/// Fetch current price and return the result in cents.
-	fn fetch_price() -> Result<u32, http::Error> {
+	fn fetch_price<'a>(remote_url: &'a [u8]) -> Result<Price, http::Error> {
+        let remote_url_str = sp_std::str::from_utf8(&remote_url)
+            .map_err(|_| http::Error::Unknown)?;
+  
 		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
 		let request =
-			http::Request::get("https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD");
+			http::Request::get(remote_url_str);
 		let pending = request.deadline(deadline).send().map_err(|_| http::Error::IoError)?;
     	let response = pending.try_wait(deadline).map_err(|_| http::Error::DeadlineReached)??;
 		if response.code != 200 {
@@ -50,61 +77,44 @@ impl<T: Config> Pallet<T> {
 			},
 		}?;
 
-		log::warn!("Got price: {} cents", price);
-
 		Ok(price)
 	}
 
-	fn parse_price(price_str: &str) -> Option<u32> {
-		let val = serde_json::from_str(price_str);
-		let price = match val.ok()? {
-			JsonValue::Object(obj) => {
-                // TODO
-				// let (_, v) = obj.into_iter().find(|(k, _)| k.iter().copied().eq("USD".chars()))?;
-				// match v {
-				// 	JsonValue::Number(number) => number,
-				// 	_ => return None,
-				// }
-                0
-			},
-			_ => return None,
-		};
+	fn parse_price(price_str: &str) -> Option<Price> {
+        let val: JsonValue = serde_json::from_str(price_str).ok()?;
+        let obj = val.as_object()?;
+        let v = obj.get("USD")?;
+        let price = match v {
+            JsonValue::Number(num) => {
+                if let Some(int_val) = num.as_u64() {
+                    // If it's already an integer, scale it
+                    int_val * NUMERATOR
+                } else if let Some(float_val) = num.as_f64() {
+                    // Convert floating-point to scaled integer
+                    (float_val * NUMERATOR as f64) as u64
+                } else {
+                    return None; // Not a valid number
+                }
+            }
+            _ => return None, // Not a number
+        };    
 
-        // TODO
-        Some(12u32)
-		// let exp = price.fraction_length.saturating_sub(2);
-		// Some(price.integer as u32 * 100 + (price.fraction / 10_u64.pow(exp)) as u32)
+		Some(price)
 	}
 
-	/// Add new price to the list.
-	pub fn add_price(maybe_who: Option<T::AccountId>, price: u32) {
-		log::info!("Adding to the average: {}", price);
-		<Prices<T>>::mutate(|prices| {
-			if prices.try_push(price).is_err() {
-				prices[(price % T::MaxPrices::get()) as usize] = price;
-			}
-		});
+    pub fn ocw_submit_tx(
+        block_number: BlockNumberFor<T>,
+        payload: Vec<PricePayload>,
+    ) -> Result<(), &'static str>{
+		SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(
+            Call::submit_price_unsigned { payload, block_number }.into()
+        ).map_err(|()| "Unable to submit unsigned transaction.")?;
+        Ok(())
+    }
 
-		let average = Self::average_price()
-			.expect("The average is not empty, because it was just mutated; qed");
-		log::info!("Current average price is: {}", average);
-		// here we are raising the NewPrice event
-		Self::deposit_event(Event::NewPrice { price, maybe_who });
-	}
-
-	/// Calculate current average price.
-	pub fn average_price() -> Option<u32> {
-		let prices = Prices::<T>::get();
-		if prices.is_empty() {
-			None
-		} else {
-			Some(prices.iter().fold(0_u32, |a, b| a.saturating_add(*b)) / prices.len() as u32)
-		}
-	}
 
 	pub fn validate_transaction_parameters(
-		block_number: &BlockNumberFor<T>,
-		new_price: &u32,
+        block_number: &BlockNumberFor<T>
 	) -> TransactionValidity {
         // Now let's check if the transaction has any chance to succeed.
 		let next_unsigned_at = NextUnsignedAt::<T>::get();
@@ -116,12 +126,9 @@ impl<T: Config> Pallet<T> {
 		if &current_block < block_number {
 			return InvalidTransaction::Future.into()
 		}
-		let avg_price = Self::average_price()
-			.map(|price| if &price > new_price { price - new_price } else { new_price - price })
-			.unwrap_or(0);
 
-		ValidTransaction::with_tag_prefix("OCWPriceFetch")
-			.priority(T::UnsignedPriority::get().saturating_add(avg_price as _))
+        ValidTransaction::with_tag_prefix("OCWPriceFetch")
+			.priority(T::UnsignedPriority::get())
 			.and_provides(next_unsigned_at)
 			.longevity(5)
 			.propagate(true)

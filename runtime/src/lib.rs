@@ -41,10 +41,12 @@ use crate::weights::constants::{
     ExtrinsicBaseWeight,
     BlockExecutionWeight
 };
-use crate::sp_runtime::generic;
-use crate::sp_runtime::MultiSignature;
-use crate::sp_runtime::traits::IdentifyAccount;
-use crate::sp_runtime::traits::Verify;
+use crate::sp_runtime::{
+    generic, MultiSignature,
+    traits::{IdentifyAccount, Verify, Extrinsic},
+    SaturatedConversion,
+
+};
 use crate::frame_system::offchain;
 
 /// The runtime version.
@@ -147,6 +149,7 @@ const MAXIMUM_BLOCK_WEIGHT: Weight =
 
 parameter_types! {
 	pub const Version: RuntimeVersion = VERSION;
+	pub const BlockHashCount: interface::BlockNumber = 2400;
     pub RuntimeBlockWeights: BlockWeights = BlockWeights::builder()
         .base_block(BlockExecutionWeight::get())
         .for_class(DispatchClass::all(), |weights| {
@@ -174,6 +177,9 @@ impl frame_system::Config for Runtime {
 	type Version = Version;
 	// Use the account data from the balances pallet
 	type AccountData = pallet_balances::AccountData<<Runtime as pallet_balances::Config>::Balance>;
+
+	/// Maximum number of block number to block hash mappings to keep (oldest pruned first).
+	type BlockHashCount = BlockHashCount;
 }
 
 type Balance = u128;
@@ -228,20 +234,84 @@ impl pallet_minimal_template::Config for Runtime { }
 
 
 parameter_types! {
-	pub const UnsignedPriority: u64 = 1 << 20;
+	pub const UnsignedInterval: interface::BlockNumber = 10;
+	pub const UnsignedPriority: interface::BlockNumber = 100;
 }
 
 impl pallet_price_fetch::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
     type AuthorityId = pallet_price_fetch::crypto::TestAuthId;
 	type UnsignedPriority = UnsignedPriority;
-	type UnsignedInterval = ConstU64<1>;
-	type MaxPrices = ConstU32<64>;
+	type UnsignedInterval = UnsignedInterval;
 }
 
 type Block = frame::runtime::types_common::BlockOf<Runtime, SignedExtra>;
 type Header = HeaderFor<Runtime>;
 pub type Address = sp_runtime::MultiAddress<AccountId, ()>;
+
+
+/// Unchecked extrinsic type as expected by this runtime.
+pub type UncheckedExtrinsic =
+	generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
+pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
+pub type SignedPayload = generic::SignedPayload<RuntimeCall, SignedExtra>;
+
+impl offchain::SigningTypes for Runtime {
+	type Public = <Signature as Verify>::Signer;
+	type Signature = Signature;
+}
+
+impl<LocalCall> offchain::SendTransactionTypes<LocalCall> for Runtime
+where
+	RuntimeCall: From<LocalCall>,
+{
+	type Extrinsic = UncheckedExtrinsic;
+	type OverarchingCall = RuntimeCall;
+}
+
+
+// implement `CreateSignedTransaction` to allow `create_transaction` of offchain worker for runtime
+impl<LocalCall> offchain::CreateSignedTransaction<LocalCall> for Runtime
+where
+	RuntimeCall: From<LocalCall>,
+{
+	fn create_transaction<C: offchain::AppCrypto<Self::Public, Self::Signature>>(
+		call: RuntimeCall,
+		public: <Signature as Verify>::Signer,
+		account: AccountId,
+		nonce: interface::Nonce,
+	) -> Option<(RuntimeCall, <UncheckedExtrinsic as Extrinsic>::SignaturePayload)> {
+		let tip = 0;
+		// take the biggest period possible.
+		let period =
+			BlockHashCount::get().checked_next_power_of_two().map(|c| c / 2).unwrap_or(2) as u64;
+		let current_block = System::block_number()
+			.saturated_into::<u64>()
+			// The `System::block_number` is initialized with `n+1`,
+			// so the actual block number is `n`.
+			.saturating_sub(1);
+		let era = generic::Era::mortal(period, current_block);
+		let extra = (
+			frame_system::CheckNonZeroSender::<Runtime>::new(),
+			frame_system::CheckSpecVersion::<Runtime>::new(),
+			frame_system::CheckTxVersion::<Runtime>::new(),
+			frame_system::CheckGenesis::<Runtime>::new(),
+			frame_system::CheckEra::<Runtime>::from(era),
+			frame_system::CheckNonce::<Runtime>::from(nonce),
+			frame_system::CheckWeight::<Runtime>::new(),
+			pallet_transaction_payment::ChargeTransactionPayment::<Runtime>::from(tip),
+		);
+		let raw_payload = SignedPayload::new(call, extra)
+			.map_err(|e| {
+				log::warn!("Unable to create signed payload: {:?}", e);
+			})
+			.ok()?;
+		let signature = raw_payload.using_encoded(|payload| C::sign(payload, public))?;
+		let address = account;
+		let (call, extra, _) = raw_payload.deconstruct();
+		Some((call, (sp_runtime::MultiAddress::Id(address), signature, extra)))
+	}
+}
 
 /// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
 pub type Signature = MultiSignature;
@@ -364,25 +434,6 @@ impl_runtime_apis! {
 		}
 	}
 }
-
-/// Unchecked extrinsic type as expected by this runtime.
-pub type UncheckedExtrinsic =
-	generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
-pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
-
-impl offchain::SigningTypes for Runtime {
-	type Public = <Signature as Verify>::Signer;
-	type Signature = Signature;
-}
-
-impl<LocalCall> offchain::SendTransactionTypes<LocalCall> for Runtime
-where
-	RuntimeCall: From<LocalCall>,
-{
-	type Extrinsic = UncheckedExtrinsic;
-	type OverarchingCall = RuntimeCall;
-}
-
 
 /// Some re-exports that the node side code needs to know. Some are useful in this context as well.
 ///

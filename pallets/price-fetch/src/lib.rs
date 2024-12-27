@@ -14,7 +14,8 @@ use polkadot_sdk::{
         pallet_prelude::*,
         offchain::{
             AppCrypto, SendUnsignedTransaction,
-            Signer, SigningTypes, SubmitTransaction,
+            SubmitTransaction,
+            CreateSignedTransaction,
         },
         pallet_prelude::BlockNumberFor,
     },
@@ -22,11 +23,8 @@ use polkadot_sdk::{
     sp_io as sp_io,
     sp_runtime::{
         offchain::{
-            http,
-            storage::{MutateStorageError, StorageRetrievalError, StorageValueRef},
-            Duration,
+            http, Duration,
         },
-        traits::Zero,
         transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
         RuntimeDebug,
     }
@@ -40,10 +38,13 @@ mod mock;
 
 mod types;
 mod price_fetch;
+mod constants;
 
 pub use pallet::*;
 
 use types::price::*;
+use types::common::*;
+use constants::*;
 
 #[frame_support::pallet(dev_mode)]
 pub mod pallet {
@@ -52,7 +53,7 @@ pub mod pallet {
 	/// This pallet's configuration trait
 	#[pallet::config]
 	pub trait Config:
-        SigningTypes + polkadot_sdk::frame_system::Config
+    CreateSignedTransaction<Call<Self>> + polkadot_sdk::frame_system::Config
 	{
 		/// The identifier type for an offchain worker.
 		type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
@@ -60,16 +61,12 @@ pub mod pallet {
 		/// The overarching event type.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as polkadot_sdk::frame_system::Config>::RuntimeEvent>;
 
-		/// Maximum number of prices.
-		#[pallet::constant]
-		type MaxPrices: Get<u32>;
-
         /// Number of blocks of cooldown after unsigned transaction is included.
 		///
 		/// This ensures that we only accept unsigned transactions once, every `UnsignedInterval`
 		/// blocks.
 		#[pallet::constant]
-        type UnsignedInterval: Get<u64>;
+		type UnsignedInterval: Get<BlockNumberFor<Self>>;
 
         /// A configuration for base priority of unsigned transactions.
 		///
@@ -83,10 +80,16 @@ pub mod pallet {
 	pub struct Pallet<T>(_);
 
 	#[pallet::storage]
-	pub type Prices<T: Config> = StorageValue<_, BoundedVec<u32, T::MaxPrices>, ValueQuery>;
+	pub type Prices<T: Config> = StorageMap<
+        _,
+        Twox64Concat,
+        StrVecBytes,
+        Price,
+        ValueQuery
+    >;
 
 	#[pallet::storage]
-	pub(super) type NextUnsignedAt<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
+	pub type NextUnsignedAt<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
 
 	#[pallet::hooks]
 	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
@@ -96,15 +99,27 @@ pub mod pallet {
     		let parent_hash = <frame_system::Pallet<T>>::block_hash(block_number - 1u32.into());
 			log::debug!("Current block: {:?} (parent hash: {:?})", block_number, parent_hash);
 
-    		let average: Option<u32> = Self::average_price();
-			log::debug!("Current price: {:?}", average);
-
 			// For this example we are going to send both signed and unsigned transactions
 			// depending on the block number.
 			// Usually it's enough to choose one or the other.
-            if let Err(e) = Self::fetch_price_and_send_raw_unsigned(block_number) {
-				log::error!("Error: {}", e);
-			}
+            let mut price_data: Vec<PricePayload> = Vec::<PricePayload>::new();
+            for (sym, remote_url) in WHITELIST_CRYPTO.iter() {
+                let res = Self::safe_fetch_price(
+                    block_number,
+                    sym,
+                    remote_url
+                );
+                match res {
+                    Ok(p) => price_data.push(PricePayload { price: p, symbol: sym.to_vec() }),
+                    Err(e) => log::error!("Fetch price error: {}", e),
+                };
+            }
+
+            if price_data.len() > 0usize {
+                if let Err(e) = Self::ocw_submit_tx(block_number, price_data) {
+                    log::error!("Submit tx error: {:?}", e);
+                }
+            }
 		}
 	}
 
@@ -113,25 +128,31 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		/// Event generated when new price is accepted to contribute to the average.
-		NewPrice { price: u32, maybe_who: Option<T::AccountId> },
+		NewPrice(Vec<u8>, Price),
 	}
+
+    #[pallet::error]
+    pub enum Error<T> {
+        PassedBlock,
+    }
 
 	/// A public part of the pallet.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
     	pub fn submit_price_unsigned(
 			origin: OriginFor<T>,
-			_block_number: BlockNumberFor<T>,
-			price: u32,
+            payload: Vec<PricePayload>,
+            block_number: BlockNumberFor<T>
 		) -> DispatchResultWithPostInfo {
-			// This ensures that the function can only be called via unsigned transaction.
+            // This ensures that the function can only be called via unsigned transaction.
 			ensure_none(origin)?;
-			// Add the price to the on-chain list, but mark it as coming from an empty address.
-			Self::add_price(None, price);
-			// now increment the block number at which we expect next unsigned transaction.
 			let current_block = <frame_system::Pallet<T>>::block_number();
-            // TODO
-			// <NextUnsignedAt<T>>::put(current_block + T::UnsignedInterval::get().into());
+            log::info!("current block: {:?}, block number: {:?}", current_block.clone(), block_number);
+            ensure!(current_block.clone() >= block_number, Error::<T>::PassedBlock);
+			// Add the price to the on-chain list, but mark it as coming from an empty address.
+			Self::add_price(payload);
+			// now increment the block number at which we expect next unsigned transaction.
+			<NextUnsignedAt<T>>::put(current_block + T::UnsignedInterval::get());
 			Ok(().into())
 		}
 	}
@@ -141,8 +162,8 @@ pub mod pallet {
 		type Call = Call<T>;
 
 		fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
-		    if let Call::submit_price_unsigned { block_number, price: new_price } = call {
-				Self::validate_transaction_parameters(block_number, new_price)
+		    if let Call::submit_price_unsigned { payload, block_number } = call {
+				Self::validate_transaction_parameters(block_number)
 			} else {
 				InvalidTransaction::Call.into()
 			}

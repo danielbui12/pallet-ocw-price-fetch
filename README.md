@@ -30,7 +30,7 @@ cargo build --release
 ### Start omni node
 
 ```sh
-pba-omni-node --runtime ./target/release/wbuild/minimal-template-runtime/minimal_template_runtime.wasm --tmp --offchain-worker always
+RUST_LOG=info pba-omni-node --runtime ./target/release/wbuild/minimal-template-runtime/minimal_template_runtime.wasm --tmp --offchain-worker always
 ```
 
 ### Start chain
@@ -75,5 +75,5 @@ chain-spec-builder create --chain-name SubstrateTemplate -r ./target/release/wbu
 
 - Start chain:
 ```sh
-pba-omni-node --chain ./chain_spec.json --tmp --offchain-worker always
+RUST_LOG=info pba-omni-node --chain ./chain_spec.json --tmp --offchain-worker always
 ```

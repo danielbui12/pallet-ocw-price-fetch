@@ -139,7 +139,6 @@
 //     type AuthorityId = pallet_price_fetch::crypto::TestAuthId;
 // 	type UnsignedPriority = UnsignedPriority;
 // 	type UnsignedInterval = ConstU64<128>;
-// 	type MaxPrices = ConstU32<64>;
 // }
 
 // // Build genesis storage according to the mock runtime.
